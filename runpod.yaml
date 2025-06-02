@@ -3,12 +3,6 @@ version: "1"
 runtime:
   type: python
   version: "3.10"
-  entrypoint: handler.py
-  requirementsPath: requirements.txt   # optional; detected automatically
+  entrypoint: handlically
 
-resources:
-  gpu: 0         # CPU runtime
-  maxWorkers: 3
-  activeWorkers: 0
-  idleTimeout: 5
-  executionTimeout: 600
+resources:nTimeout: 600
