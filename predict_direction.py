@@ -1,73 +1,116 @@
 # predict_direction.py
 """
 Print “UP” or “DOWN” for SPY.
-  MODE = "daily"   → today-vs-yesterday
-  MODE = "hourly"  → next-hour drift
-Run inside /workspace/xlstm-ts on the same pod that trained the weights.
+
+• MODE = "daily"  → next-day move (Stooq, 256-bar look-back)
+• MODE = "hourly" → next-hour move (Tiingo 1-hour bars, 336-bar look-back)
+
+Requires checkpoints produced by train_spy_models.py that include:
+    xlstm, in_proj, out_proj, scaler
+(where scaler is either (mu, sigma) or an sklearn MinMaxScaler).
 """
 
-import os, sys, pathlib, datetime as dt, requests, pandas as pd, torch
+import os
+import sys
+import pathlib
+import datetime as dt
+import requests
+import pandas as pd
+import numpy as np
+import torch
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from ml.data.preprocessing            import wavelet_denoising
-from ml.models.xlstm_ts.preprocessing import normalise_data_xlstm, create_sequences
+from ml.data.preprocessing import wavelet_denoising
+from ml.models.xlstm_ts.preprocessing import create_sequences
 from ml.models.xlstm_ts.xlstm_ts_model import create_xlstm_model
 
-# -- choose forecast granularity --
-MODE      = "daily"           # "daily"  or "hourly"
-LOOKBACK  = 256 if MODE == "daily" else 336
+# ── configuration ────────────────────────────────────────────────────────
+MODE = "hourly"                    # "daily" or "hourly"
+LOOKBACK = 256 if MODE == "daily" else 336
 CKPT_FILE = ROOT / "weights" / f"xlstm_spy_{MODE}.pth"
 
-# -- device handling (GPU if available) --
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 1. load checkpoint (CPU first, then .to(device))
-ckpt   = torch.load(CKPT_FILE, map_location="cpu")
-model, in_proj, out_proj = create_xlstm_model(LOOKBACK)   # built on CPU
-model.load_state_dict(ckpt["xlstm"])
-in_proj.load_state_dict(ckpt["in_proj"])
-out_proj.load_state_dict(ckpt["out_proj"])
+# ── 1. load checkpoint (weights + scaler) ───────────────────────────────
+state = torch.load(CKPT_FILE, map_location="cpu")
+scaler = state["scaler"]                        # (mu, σ) tuple or sklearn scaler
 
-model     = model.to(device).eval()
-in_proj   = in_proj.to(device)
-out_proj  = out_proj.to(device)
+model, in_proj, out_proj = create_xlstm_model(LOOKBACK)
+model.load_state_dict(state["xlstm"])
+in_proj.load_state_dict(state["in_proj"])
+out_proj.load_state_dict(state["out_proj"])
 
-# 2. fetch most-recent price window
-start_date = (dt.datetime.utcnow() - dt.timedelta(days=LOOKBACK*3)).strftime("%Y-%m-%d")
+model = model.to(DEVICE).eval()
+in_proj = in_proj.to(DEVICE)
+out_proj = out_proj.to(DEVICE)
+
+# ── 2. fetch most-recent LOOKBACK bars ──────────────────────────────────
+start_date = (
+    dt.datetime.utcnow() - dt.timedelta(days=LOOKBACK * 3)
+).strftime("%Y-%m-%d")
 
 if MODE == "daily":
     from pandas_datareader import data as pdr
-    prices = (pdr.DataReader("SPY", "stooq", start_date, dt.datetime.utcnow())
-                .sort_index())["Close"].astype(float)
+
+    prices = (
+        pdr.DataReader("SPY", "stooq", start_date, dt.datetime.utcnow())
+        .sort_index()
+    )["Close"].astype(float)
 else:
     url = "https://api.tiingo.com/iex/spy/prices"
-    params = {
-        "token": os.environ["TIINGO_TOKEN"],
-        "startDate": start_date,
-        "resampleFreq": "1Hour",
-        "columns": "close"
-    }
-    rows = requests.get(url, params=params, timeout=30).json()
-    prices = (pd.DataFrame(rows)
-                .assign(date=lambda d: pd.to_datetime(d["date"]))
-                .set_index("date")["close"].astype(float))
+    rows = requests.get(
+        url,
+        params={
+            "token": os.environ["TIINGO_TOKEN"],
+            "startDate": start_date,
+            "resampleFreq": "1Hour",
+            "columns": "close",
+        },
+        timeout=30,
+    ).json()
+    prices = (
+        pd.DataFrame(rows)
+        .assign(date=lambda d: pd.to_datetime(d["date"]))
+        .set_index("date")["close"]
+        .astype(float)
+    )
 
 prices = prices.tail(LOOKBACK)
 if len(prices) < LOOKBACK:
-    raise SystemExit(f"Need {LOOKBACK} rows, got {len(prices)}")
+    sys.exit(f"Need {LOOKBACK} rows, got {len(prices)}")
 
-# 3. pre-process exactly like training
+# ── 3. apply SAME scaling used in training ──────────────────────────────
 series = wavelet_denoising(prices.values)
-series, _ = normalise_data_xlstm(series)
-X, _, _   = create_sequences(series, prices.index)
-inp       = torch.tensor(X[-1:], dtype=torch.float32).to(device)   # (1,L,1)
 
-# 4. predict & print direction
+if isinstance(scaler, tuple):  # (mu, σ)
+    mu, sigma = scaler
+    series_norm = (series - mu) / sigma
+    inv_scale = lambda z: z * sigma + mu
+else:  # MinMaxScaler
+    series_norm = scaler.transform(series.reshape(-1, 1)).ravel()
+    inv_scale = lambda z: scaler.inverse_transform([[z]])[0, 0]
+
+X, _, _ = create_sequences(series_norm, prices.index)
+# ...  (imports and earlier code unchanged) ...
+
+# ---- ensure shape (N, seq_len, 1)  *feature channel last* -------------
+if X.ndim == 2:                       # (N, seq_len)
+    X = X[:, :, None]                 # → (N, seq_len, 1)
+elif X.shape[-1] != 1:                # feature not last
+    # (N, 1, seq_len)  →  (N, seq_len, 1)
+    X = np.transpose(X, (0, 2, 1))
+# -----------------------------------------------------------------------
+
+inp = torch.tensor(X[-1:], dtype=torch.float32, device=DEVICE)
+
 with torch.no_grad():
-    forecast = out_proj(model(in_proj(inp)))[0, -1].item()
+    pred_scaled = out_proj(model(in_proj(inp)))[0, -1].item()
 
-last_close = prices.iloc[-1]
-direction  = "UP" if forecast > last_close else "DOWN"
-print(f"{MODE.capitalize()} forecast: {forecast:.2f} | last close {last_close:.2f} → {direction}")
+pred_raw     = inv_scale(pred_scaled)
+prior_close  = prices.iloc[-1]
+direction    = "UP" if pred_raw > prior_close else "DOWN"
+
+print(f"{MODE.capitalize()} · Prior close: {prior_close:.2f} | "
+      f"Predicted next: {pred_raw:.2f} | Direction: {direction}")
