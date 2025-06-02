@@ -20,7 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from ml.data.preprocessing import wavelet_denoising
-from ml.models.xlstm_ts.preprocessing import normalise_data_xlstm, create_sequences
+from ml.models.xlstm_ts.preprocessing import create_sequences
 from ml.models.xlstm_ts.xlstm_ts_model import create_xlstm_model
 
 LOOKBACK = 336
@@ -63,22 +63,33 @@ def load_model(device: torch.device):
     model = model.to(device).eval()
     in_proj = in_proj.to(device)
     out_proj = out_proj.to(device)
-    return model, in_proj, out_proj
+    scaler = ckpt.get("scaler")
+    return model, in_proj, out_proj, scaler
 
 def fetch_prices():
     end = dt.datetime.utcnow()
     start = (end - dt.timedelta(days=LOOKBACK * 3)).strftime("%Y-%m-%d")
     return tiingo_hourly("SPY", start)
 
-def prepare_input(prices, device):
+def prepare_input(prices, scaler, device):
     series = wavelet_denoising(prices.values)
-    series, _ = normalise_data_xlstm(series)
-    X, _, _ = create_sequences(series, prices.index)
-    return torch.tensor(X[-1:], dtype=torch.float32).to(device)
 
-def predict_next_hour(model, in_proj, out_proj, inp):
+    if isinstance(scaler, tuple):
+        mu, sigma = scaler
+        series_norm = (series - mu) / sigma
+        inv_scale = lambda z: z * sigma + mu
+    else:
+        series_norm = scaler.transform(series.reshape(-1, 1)).ravel()
+        inv_scale = lambda z: scaler.inverse_transform([[z]])[0, 0]
+
+    X, _, _ = create_sequences(series_norm, prices.index)
+    inp = torch.tensor(X[-1:], dtype=torch.float32).to(device)
+    return inp, inv_scale
+
+def predict_next_hour(model, in_proj, out_proj, inp, inv_scale):
     with torch.no_grad():
-        return out_proj(model(in_proj(inp)))[0, -1].item()
+        scaled = out_proj(model(in_proj(inp)))[0, -1].item()
+    return inv_scale(scaled)
 
 # ---------------------------------------------------------------------------
 
@@ -98,7 +109,6 @@ def load_csv(path: pathlib.Path) -> pd.DataFrame:
     )
 
 def update_actuals(df: pd.DataFrame, prices: pd.Series) -> pd.DataFrame:
-    latest = prices.index[-1]
     for idx, row in df[df["actual_close"].isna()].iterrows():
         ts = row["timestamp"]
         if ts in prices.index:
@@ -130,11 +140,11 @@ def append_prediction(df: pd.DataFrame, ts: pd.Timestamp,
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, in_proj, out_proj = load_model(device)
+    model, in_proj, out_proj, scaler = load_model(device)
     prices = fetch_prices()
 
-    inp = prepare_input(prices, device)
-    forecast = predict_next_hour(model, in_proj, out_proj, inp)
+    inp, inv_scale = prepare_input(prices, scaler, device)
+    forecast = predict_next_hour(model, in_proj, out_proj, inp, inv_scale)
 
     last_close = float(prices.iloc[-1])
     next_timestamp = prices.index[-1] + pd.Timedelta(hours=1)
