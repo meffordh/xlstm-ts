@@ -32,6 +32,7 @@ def tiingo_hourly(ticker: str, start: str, lookback: int = 336) -> pd.Series:
         "token"       : os.environ["TIINGO_TOKEN"],
         "startDate"   : start,
         "resampleFreq": "1Hour",
+        "afterHours": "true",
         "columns"     : "close"
     }, timeout=30)
     resp.raise_for_status()
@@ -98,7 +99,7 @@ def main(hourly_only: bool = False):
         train_frequency("daily", daily, lookback=256, epochs_hint=20)
 
     end   = dt.datetime.utcnow()
-    start = (end - dt.timedelta(days=120)).strftime("%Y-%m-%d")
+    start = (end - dt.timedelta(days=365)).strftime("%Y-%m-%d")
     hourly = tiingo_hourly("SPY", start)
     train_frequency("hourly", hourly, lookback=336, epochs_hint=15)
 
