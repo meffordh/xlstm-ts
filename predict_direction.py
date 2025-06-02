@@ -27,7 +27,7 @@ from ml.models.xlstm_ts.preprocessing import create_sequences
 from ml.models.xlstm_ts.xlstm_ts_model import create_xlstm_model
 
 # ── configuration ────────────────────────────────────────────────────────
-MODE = "daily"                    # "daily" or "hourly"
+MODE = "hourly"                    # "daily" or "hourly"
 LOOKBACK = 365 if MODE == "daily" else 336
 CKPT_FILE = ROOT / "weights" / f"xlstm_spy_{MODE}.pth"
 
