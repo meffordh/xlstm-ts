@@ -96,7 +96,7 @@ def main(hourly_only: bool = False):
 
     if not hourly_only:
         daily = robust_download("SPY", "2000-01-01", today, "1d")
-        train_frequency("daily", daily, lookback=256, epochs_hint=20)
+        train_frequency("daily", daily, lookback=512, epochs_hint=20)
 
     end   = dt.datetime.utcnow()
     start = (end - dt.timedelta(days=365)).strftime("%Y-%m-%d")

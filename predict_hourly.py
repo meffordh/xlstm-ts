@@ -12,6 +12,7 @@ import os
 import pathlib
 import datetime as dt
 import pandas as pd
+import numpy as np
 import torch
 import requests
 import sys
@@ -83,7 +84,14 @@ def prepare_input(prices, scaler, device):
         inv_scale = lambda z: scaler.inverse_transform([[z]])[0, 0]
 
     X, _, _ = create_sequences(series_norm, prices.index)
-    inp = torch.tensor(X[-1:], dtype=torch.float32).to(device)
+
+    # ensure input has shape (N, seq_len, 1)
+    if X.ndim == 2:
+        X = X[:, :, None]
+    elif X.shape[-1] != 1:
+        X = np.transpose(X, (0, 2, 1))
+
+    inp = torch.tensor(X[-1:], dtype=torch.float32, device=device)
     return inp, inv_scale
 
 def predict_next_hour(model, in_proj, out_proj, inp, inv_scale):
@@ -109,6 +117,9 @@ def load_csv(path: pathlib.Path) -> pd.DataFrame:
     )
 
 def update_actuals(df: pd.DataFrame, prices: pd.Series) -> pd.DataFrame:
+# after df = update_actuals(df, prices)
+    if not df["timestamp"].eq(next_timestamp).any():       # <- NEW
+        df = append_prediction(df, next_timestamp, forecast, last_close)
     for idx, row in df[df["actual_close"].isna()].iterrows():
         ts = row["timestamp"]
         if ts in prices.index:
